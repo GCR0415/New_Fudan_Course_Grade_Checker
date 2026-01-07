@@ -1,6 +1,8 @@
 import requests
 import re
 import os
+import sys
+import time
 import json
 import base64
 import smtplib
@@ -12,8 +14,8 @@ from cryptography.fernet import Fernet
 
 """
 Fudan University Grade Crawler
-Target Page: https://fdjwgl.fudan.edu.cn/student/for-std/grade/sheet/semester-index/462977
-API Endpoint: https://fdjwgl.fudan.edu.cn/student/for-std/grade/sheet/info/462977
+Target Page: https://fdjwgl.fudan.edu.cn/student/for-std/grade/sheet/
+API Endpoint: https://fdjwgl.fudan.edu.cn/student/for-std/grade/sheet/info/{grade_sheet_id}
 Course Info API: https://fdjwgl.fudan.edu.cn/student/for-std/lesson-search/semester/{semester_id}/search/{grade_sheet_id}?courseCodeLike={course_code}&courseNameZhLike={course_name}&queryPage__=1%2C20
 
 Authentication:
@@ -36,12 +38,19 @@ GRADES_FILE = "grades_encrypted.json"
 SMTP_SERVER = 'smtp.qq.com'
 SMTP_PORT = 465 # SSL port for QQ SMTP
 
-def get_encryption_key(password):
-    """Generates a Fernet key from the UIS password."""
-    # Use SHA256 hash of the password to derive a 32-byte key for Fernet.
-    # Then base64 encode it.
+def get_encryption_key():
+    """Generates a Fernet key from 4 environment variables to prevent collision."""
+    stu_id = os.environ.get("StuId", "")
+    password = os.environ.get("UISPsw", "")
+    sender = os.environ.get("QQ_EMAIL_SENDER", "")
+    smtp = os.environ.get("QQ_SMTP", "")
+    
+    # Combine variables with separators to ensure uniqueness
+    raw_key = f"{stu_id}|{password}|{sender}|{smtp}"
+    
+    # Use SHA256 hash to derive a 32-byte key for Fernet
     import hashlib
-    key = base64.urlsafe_b64encode(hashlib.sha256(password.encode('utf-8')).digest())
+    key = base64.urlsafe_b64encode(hashlib.sha256(raw_key.encode('utf-8')).digest())
     return key
 
 def encrypt_data(data, key):
@@ -135,7 +144,7 @@ def crawl_grades():
 
     if not stu_id or not password:
         print("[-] Error: Environment variables StuId and UISPsw must be set.")
-        return
+        sys.exit(1)
 
     session = requests.Session()
     session.headers.update({
@@ -143,13 +152,12 @@ def crawl_grades():
     })
 
     # Step 1: Access target page to trigger redirection to UIS
-    target_url = "https://fdjwgl.fudan.edu.cn/student/for-std/grade/sheet/semester-index/462977"
+    target_url = "https://fdjwgl.fudan.edu.cn/student/for-std/grade/sheet/"
     print(f"[*] Accessing {target_url}...")
     try:
         res = session.get(target_url, allow_redirects=True)
     except Exception as e:
-        print(f"[-] Network error: {e}")
-        return
+        raise Exception(f"[-] Network error: {e}")
     
     # Extract lck and entityId from the UIS login URL
     lck = None
@@ -163,8 +171,7 @@ def crawl_grades():
         entityId = requests.utils.unquote(match_eid.group(1))
 
     if not lck or not entityId:
-        print("[-] Failed to get authentication parameters from redirect URL.")
-        return
+        raise Exception("[-] Failed to get authentication parameters from redirect URL.")
 
     # Step 2: Query authentication methods to get authChainCode
     print("[*] Querying authentication methods...")
@@ -175,8 +182,7 @@ def crawl_grades():
         auth_chain_code = query_data['data'][0]['authChainCode']
         request_type = query_data['requestType']
     except Exception as e:
-        print(f"[-] Failed to query auth methods: {e}")
-        return
+        raise Exception(f"[-] Failed to query auth methods: {e}")
 
     # Step 3: Get RSA public key for password encryption
     print("[*] Retrieving RSA public key...")
@@ -185,8 +191,7 @@ def crawl_grades():
         res_pub = session.post(pub_key_url)
         pub_key = res_pub.json()['data']
     except Exception as e:
-        print(f"[-] Failed to get public key: {e}")
-        return
+        raise Exception(f"[-] Failed to get public key: {e}")
 
     # Step 4: Encrypt password
     encrypted_password_uis = encrypt_password(password, pub_key)
@@ -210,12 +215,10 @@ def crawl_grades():
         res_execute = session.post(execute_url, json=payload)
         execute_data = res_execute.json()
     except Exception as e:
-        print(f"[-] Authentication request failed: {e}")
-        return
+        raise Exception(f"[-] Authentication request failed: {e}")
 
     if execute_data.get('code') != 200 and execute_data.get('code') != "200":
-        print(f"[-] Authentication failed: {execute_data.get('message')}")
-        return
+        raise Exception(f"[-] Authentication failed: {execute_data.get('message')}")
 
     login_token = execute_data['loginToken']
 
@@ -228,16 +231,17 @@ def crawl_grades():
         # Extract locationValue from JS redirect script
         match_loc = re.search(r'var locationValue = "([^"]+)"', res_engine.text)
         if not match_loc:
-            print("[-] Failed to find redirection link in authentication engine response.")
-            return
+            raise Exception("[-] Failed to find redirection link in authentication engine response.")
         
         redirect_url = match_loc.group(1).replace('&amp;', '&')
         # Visit the redirect URL to set cookies for the student system
         res_final = session.get(redirect_url, allow_redirects=True)
         print(f"[+] Login final redirection: {res_final.url}")
     except Exception as e:
-        print(f"[-] Session finalization failed: {e}")
-        return
+        raise Exception(f"[-] Session finalization failed: {e}")
+
+    # Add a short delay to ensure the session is fully established on the server side
+    time.sleep(1)
 
     # Step 7: Dynamically find the grade sheet ID
     grade_base_url = "https://fdjwgl.fudan.edu.cn/student/for-std/grade/sheet/"
@@ -246,16 +250,12 @@ def crawl_grades():
         res_detect = session.get(grade_base_url, allow_redirects=True)
         match_id = re.search(r'semester-index/(\d+)', res_detect.url)
         if not match_id:
-            print(f"[-] Failed to detect grade sheet ID. Final URL was: {res_detect.url}")
-            grade_sheet_id = "462977" # Fallback to the ID provided in the task description
-            print(f"[*] Falling back to default ID: {grade_sheet_id}")
+            raise Exception(f"[-] Failed to detect grade sheet ID. Final URL was: {res_detect.url}")
         else:
             grade_sheet_id = match_id.group(1)
             print(f"[+] Detected grade sheet ID: {grade_sheet_id}")
     except Exception as e:
-        print(f"[-] Error detecting grade sheet ID: {e}")
-        grade_sheet_id = "462977" # Fallback
-        print(f"[*] Falling back to default ID: {grade_sheet_id}")
+        raise Exception(f"[-] Error detecting grade sheet ID: {e}")
 
     # Step 8: Fetch grades from API
     grade_api = f"https://fdjwgl.fudan.edu.cn/student/for-std/grade/sheet/info/{grade_sheet_id}"
@@ -285,21 +285,20 @@ def crawl_grades():
             print("[+] Grades and credits fetched successfully!")
             return grades_data
         else:
-            print(f"[-] Failed to fetch grades. Status code: {res_grades.status_code}")
+            raise Exception(f"[-] Failed to fetch grades. Status code: {res_grades.status_code}")
     except Exception as e:
-        print(f"[-] Error fetching grades: {e}")
+        raise Exception(f"[-] Error fetching grades: {e}")
     return None
 
-def compare_and_notify(new_grades_data, uis_password):
+def compare_and_notify(new_grades_data):
     """Compares new grades with old, calculates GPA, and sends notifications."""
     sender_email = os.environ.get("QQ_EMAIL_SENDER")
     stu_id = os.environ.get("StuId")
     recipient_email = f"{stu_id}@m.fudan.edu.cn" if stu_id else None
     smtp_auth_code = os.environ.get("QQ_SMTP")
 
-    if not uis_password:
-        print("[-] Error: UISPsw environment variable must be set to derive encryption key.")
-        return
+    # UISPsw is needed for key generation implicitly by get_encryption_key
+    # We check required vars for email and basic logic here
     if not smtp_auth_code:
         print(f"[-] Error: QQ_SMTP environment variable must be set for email notification.")
         return
@@ -310,7 +309,7 @@ def compare_and_notify(new_grades_data, uis_password):
         print("[-] Error: StuId environment variable must be set to determine recipient email.")
         return
 
-    key = get_encryption_key(uis_password)
+    key = get_encryption_key()
 
     old_grades_data = {}
     if os.path.exists(GRADES_FILE):
@@ -454,12 +453,12 @@ def main():
     uis_password = os.environ.get('UISPsw')
     if not uis_password:
         print("[-] Error: UISPsw environment variable must be set.")
-        return
+        sys.exit(1)
 
     new_grades_data = crawl_grades()
     if new_grades_data:
         format_grades(new_grades_data)
-        compare_and_notify(new_grades_data, uis_password)
+        compare_and_notify(new_grades_data)
 
 if __name__ == "__main__":
     main()
